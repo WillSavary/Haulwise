@@ -2,22 +2,12 @@
 
 const STORAGE_KEY = "haulwise-browser-demo-v1";
 const defaultData = {
-    truck: { name: "2022 Freightliner Cascadia", unit: "104", plate: "" },
-    trips: [{
-        id: "sample-trip",
-        company: "Northstar Freight",
-        reference: "Load 4821",
-        origin: "Columbus, OH",
-        originAddress: "",
-        destination: "Sample receiver · Indianapolis, IN",
-        address: "",
-        entry: "",
-        start: 248120,
-        end: 248304,
-        date: new Date().toISOString()
-    }],
+    truck: { name: "", unit: "", plate: "" },
+    trips: [],
     facilities: []
 };
+
+let previousTripsDetected = false;
 
 function readData() {
     let saved;
@@ -41,6 +31,8 @@ function readData() {
         return structuredClone(defaultData);
     }
     if (!Array.isArray(data.facilities)) data.facilities = [];
+    previousTripsDetected = data.trips.length > 0;
+    data.trips = [];
     return data;
 }
 
@@ -48,210 +40,52 @@ let data = readData();
 const statusMessage = document.querySelector("#status-message");
 let currentRouteStart = null;
 let liveLocationWatch = null;
-let accountUser = null;
-let pendingSyncTimer = null;
-let syncQueue = Promise.resolve();
-const localImportData = structuredClone(data);
+let routeMap = null;
+let currentLocationMarker = null;
+let currentAccuracyCircle = null;
+let routeOriginMarker = null;
+let routeDestinationMarker = null;
+let routePolyline = null;
+let followCurrentLocation = true;
+let lastNominatimRequestAt = 0;
+let routeInputRevision = 0;
+
+const NOMINATIM_URL = "https://nominatim.openstreetmap.org/search";
+const OSRM_URL = "https://router.project-osrm.org/route/v1/driving";
+
+if (previousTripsDetected) {
+    try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    } catch (error) {
+        console.error("Could not clear previous local trip history:", error);
+        showStatus("Previous trip history could not be cleared from this browser. Clear this site's stored data before continuing.", true);
+    }
+}
 
 function saveData() {
-    if (accountUser) {
-        queueAccountSync();
-    } else {
-        try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-        } catch {
-            showStatus("Browser storage is unavailable. Changes will remain only until this page closes.", true);
-        }
-    }
-}
-
-function queueAccountSync() {
-    window.clearTimeout(pendingSyncTimer);
-    pendingSyncTimer = window.setTimeout(() => {
-        const snapshot = structuredClone(data);
-        syncQueue = syncQueue.then(async () => {
-            const response = await fetch("/api/account/data", {
-                method: "PUT",
-                credentials: "same-origin",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ data: snapshot })
-            });
-            const result = await response.json();
-            if (!response.ok) throw new Error(result.error || "Could not sync account data.");
-            showStatus("Trip and truck details synced to your signed-in workspace.", false);
-        }).catch((error) => {
-            showStatus(error.message, true);
-        });
-    }, 250);
-}
-
-async function initializeAccountSync() {
     try {
-        const statusResponse = await fetch("/api/auth/status", { credentials: "same-origin" });
-        if (!statusResponse.ok) throw new Error("Could not check account status.");
-        const status = await statusResponse.json();
-        if (!status.authenticated) return;
-
-        const dataResponse = await fetch("/api/account/data", { credentials: "same-origin" });
-        const result = await dataResponse.json();
-        if (!dataResponse.ok) throw new Error(result.error || "Could not load your account data.");
-
-        accountUser = status.user;
-        document.querySelector("#account-sync-panel").hidden = false;
-        document.querySelector("#account-link").hidden = true;
-        const badge = document.querySelector("#demo-mode-badge");
-        const badgeDot = document.createElement("span");
-        badgeDot.setAttribute("aria-hidden", "true");
-        badgeDot.textContent = "●";
-        badge.replaceChildren(badgeDot, document.createTextNode(" Signed in"));
-        document.querySelector("#account-sync-status").textContent = `${accountUser.name} · ${accountUser.companyName || "Personal workspace"} · GPS is not synced.`;
-        data = result.data;
-        renderTrips();
-    } catch (error) {
-        if (window.location.protocol === "file:") return;
-        showStatus(error.message, true);
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+            truck: data.truck,
+            trips: [],
+            facilities: data.facilities
+        }));
+    } catch {
+        showStatus("Browser storage is unavailable. Changes will remain only until this page closes.", true);
     }
 }
 
-async function importLocalData() {
-    const button = document.querySelector("#import-local-data");
-    if (!window.confirm("Import this browser's trips, truck details (including an optional plate), and facilities into your signed-in account? The demo sample trip and current GPS location are excluded.")) return;
-    button.disabled = true;
-    try {
-        const importData = structuredClone(localImportData);
-        if (importData.truck.name === defaultData.truck.name
-            && importData.truck.unit === defaultData.truck.unit
-            && !importData.truck.plate) {
-            importData.truck = null;
-        }
-        const response = await fetch("/api/account/import", {
-            method: "POST",
-            credentials: "same-origin",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ data: importData })
-        });
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.error || "Could not import local data.");
-        data = result.data;
-        renderTrips();
-        showStatus(`Imported ${result.imported} trip and facility records. Current GPS coordinates were not included.`, false);
-    } catch (error) {
-        showStatus(error.message, true);
-    } finally {
-        button.disabled = false;
-    }
-}
-
-async function signOutAccount() {
-    try {
-        const response = await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
-        if (!response.ok) throw new Error("Could not sign out. Try again.");
-        window.location.assign("account.html");
-    } catch (error) {
-        showStatus(error.message, true);
-    }
-
-    async function fleetJson(url, options = {}) {
-        const response = await fetch(url, {
-            credentials: "same-origin",
-            headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-            ...options
-        });
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.error || "Fleet operation could not be completed.");
-        return result;
-    }
-
-    async function loadFleetViews() {
-        try {
-            const status = await fleetJson("/api/fleet/status");
-            renderTeamMembers(status.team);
-            renderPayrollDrivers(status.team);
-            await loadFleetReports();
-            await loadPayrollPeriods();
-        } catch (error) {
-            showStatus(error.message, true);
-        }
-
-        function renderTeamMembers(team) {
-            const list = document.querySelector("#team-members");
-            list.replaceChildren();
-            if (!team.length) {
-                const empty = document.createElement("p");
-                empty.className = "empty-state";
-                empty.textContent = "No team members are attached to this workspace yet.";
-                list.append(empty);
-                return;
-            }
-            team.forEach((member) => {
-                const row = document.createElement("article");
-                row.className = "facility-row";
-                row.innerHTML = `<div class="facility-details"><strong>${member.name}</strong><span>${member.email} · ${member.role} · ${member.status}</span></div>`;
-                list.append(row);
-            });
-        }
-
-        function renderPayrollDrivers(team) {
-            const select = document.querySelector("#payroll-driver-select");
-            select.replaceChildren(new Option("Select a driver", ""));
-            team.filter((member) => member.role === "driver" && member.status === "active").forEach((member) => {
-                select.add(new Option(member.name, member.id));
-            });
-        }
-    }
-
-    async function loadFleetReports() {
-        const result = await fleetJson("/api/fleet/reports");
-        const metrics = document.querySelector("#fleet-report-metrics");
-        metrics.replaceChildren();
-        [
-            ["Total miles", result.miles],
-            ["Trips", result.tripCount],
-            ["Trucks", result.activeTrucks],
-            ["Active drivers", result.activeDrivers]
-        ].forEach(([label, value]) => {
-            const card = document.createElement("article");
-            card.className = "metric-card";
-            const name = document.createElement("span");
-            name.className = "metric-label";
-            name.textContent = label;
-            const amount = document.createElement("strong");
-            amount.textContent = formatNumber(value);
-            card.append(name, amount);
-            metrics.append(card);
-        });
-    }
-
-    async function loadPayrollPeriods() {
-        const result = await fleetJson("/api/fleet/payroll/periods");
-        const list = document.querySelector("#payroll-periods");
-        const select = document.querySelector("#payroll-period-select");
-        const selected = select.value;
-        select.replaceChildren(new Option("Select a payroll period", ""));
-        result.periods.forEach((period) => select.add(new Option(`${period.name} · ${period.start_date} to ${period.end_date}`, period.id)));
-        if (result.periods.some((period) => period.id === selected)) select.value = selected;
-        list.replaceChildren();
-        if (!result.periods.length) {
-            const empty = document.createElement("p");
-            empty.className = "empty-state";
-            empty.textContent = "No payroll periods have been created.";
-            list.append(empty);
-            return;
-        }
-        result.periods.forEach((period) => {
-            const row = document.createElement("article");
-            row.className = "facility-row";
-            const detail = document.createElement("div");
-            detail.className = "facility-details";
-            detail.innerHTML = `<strong>${period.name}</strong><span>${period.start_date} to ${period.end_date} · ${period.entry_count} entries · $${Number(period.total_amount).toFixed(2)} · ${period.status}</span>`;
-            const link = document.createElement("a");
-            link.className = "text-button";
-            link.href = `/api/fleet/payroll/periods/${encodeURIComponent(period.id)}/export`;
-            link.textContent = "Export CSV";
-            row.append(detail, link);
-            list.append(row);
-        });
-    }
+function downloadTripCsv(trip) {
+    const file = createTripCsv(trip, data.truck);
+    const blob = new Blob([file.contents], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = file.filename;
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function showStatus(message, isError) {
@@ -350,6 +184,7 @@ function makeFacilityRow(facility) {
     useButton.className = "text-button";
     useButton.textContent = "Use for route";
     useButton.addEventListener("click", () => {
+        invalidateRoutePreview();
         applyFacility(facility, document.querySelector("#route-destination"), document.querySelector("#route-entry-notes"));
         document.querySelector("#route-facility-select").value = facility.id;
         showRouteStatus(`${facility.name} loaded as the route destination. Confirm the entrance before departure.`, false);
@@ -364,7 +199,6 @@ function makeFacilityRow(facility) {
     deleteButton.textContent = "Delete";
     deleteButton.addEventListener("click", () => {
         if (!window.confirm(`Remove ${facility.name} from this browser's saved facilities?`)) return;
-        if (accountUser) deleteAccountFacility(facility.id);
         data.facilities = data.facilities.filter((saved) => saved.id !== facility.id);
         saveData();
         renderFacilities();
@@ -373,21 +207,6 @@ function makeFacilityRow(facility) {
     actions.append(useButton, editButton, deleteButton);
     row.append(details, actions);
     return row;
-}
-
-async function deleteAccountFacility(id) {
-    try {
-        const response = await fetch(`/api/account/facilities/${encodeURIComponent(id)}`, {
-            method: "DELETE",
-            credentials: "same-origin"
-        });
-        if (!response.ok) {
-            const result = await response.json();
-            throw new Error(result.error || "Could not remove the saved facility from your account.");
-        }
-    } catch (error) {
-        showStatus(error.message, true);
-    }
 }
 
 function renderFacilities() {
@@ -428,25 +247,19 @@ function renderTrips() {
     const recent = document.querySelector("#recent-trips");
     const all = document.querySelector("#all-trips");
     const trips = [...data.trips].sort((a, b) => new Date(b.date) - new Date(a.date));
-    const totalMiles = trips.reduce((total, trip) => total + tripMiles(trip), 0);
-    const now = new Date();
-    const monthMiles = trips.filter((trip) => {
-        const date = new Date(trip.date);
-        return date.getMonth() === now.getMonth() && date.getFullYear() === now.getFullYear();
-    }).reduce((total, trip) => total + tripMiles(trip), 0);
 
-    document.querySelector("#metric-miles").textContent = formatNumber(monthMiles);
+    document.querySelector("#metric-miles").textContent = "CSV";
     document.querySelector("#metric-trips").textContent = formatNumber(trips.length);
     document.querySelector("#metric-truck").textContent = data.truck.name || "Not set";
     document.querySelector("#metric-truck-sub").textContent = data.truck.unit ? `Unit ${data.truck.unit}` : "Add a unit number";
-    document.querySelector("#trip-count").textContent = `${trips.length} ${trips.length === 1 ? "trip" : "trips"} · ${formatNumber(totalMiles)} mi`;
+    document.querySelector("#trip-count").textContent = `${trips.length} trips retained`;
 
     for (const [container, list] of [[recent, trips.slice(0, 3)], [all, trips]]) {
         container.replaceChildren();
         if (list.length === 0) {
             const empty = document.createElement("p");
             empty.className = "empty-state";
-            empty.textContent = "No trips yet. Add your first trip to start your mileage book.";
+            empty.textContent = "No trips are kept here. Complete a trip to download its CSV file.";
             container.append(empty);
         } else {
             list.forEach((trip) => container.append(makeTripRow(trip)));
@@ -473,12 +286,14 @@ function showView(view) {
     const heading = document.querySelector(`#view-${view} h2`);
     if (heading) heading.setAttribute("tabindex", "-1"), heading.focus({ preventScroll: true });
     window.scrollTo({ top: 0, behavior: "smooth" });
+    if (view === "trips") ensureRouteMap();
 }
 
 function openTripRoute(trip) {
     showView("trips");
     stopLiveLocation("");
     currentRouteStart = null;
+    invalidateRoutePreview();
     document.querySelector("#open-current-map").hidden = true;
     document.querySelector("#route-start").value = trip.originAddress || trip.origin || "";
     document.querySelector("#route-destination").value = trip.address || "";
@@ -574,20 +389,12 @@ async function copyRoute() {
 document.querySelectorAll("[data-view]").forEach((button) => {
     button.addEventListener("click", () => {
         showView(button.dataset.view);
-        if (["team", "payroll", "reports", "eld"].includes(button.dataset.view)) loadFleetViews();
     });
 });
 
 document.querySelector("#open-route-planner").addEventListener("click", () => {
     showView("trips");
     document.querySelector("#route-start").focus();
-});
-
-document.querySelectorAll("[data-locked]").forEach((button) => {
-    button.addEventListener("click", () => {
-        showStatus(`${button.dataset.locked} is reserved for business accounts. Explore the business plan to learn more.`, false);
-        window.setTimeout(() => document.querySelector(".upgrade-card a").focus(), 0);
-    });
 });
 
 document.querySelector(".notice-close").addEventListener("click", () => {
@@ -612,6 +419,220 @@ function updateCurrentMapLink() {
     const { latitude, longitude } = currentRouteStart;
     mapLink.href = `https://www.openstreetmap.org/?mlat=${latitude}&mlon=${longitude}#map=16/${latitude}/${longitude}`;
     mapLink.hidden = false;
+}
+
+function showRouteMapStatus(message, isError) {
+    const status = document.querySelector("#route-map-status");
+    status.textContent = message;
+    status.classList.toggle("is-error", Boolean(isError));
+}
+
+function ensureRouteMap() {
+    if (!window.L) {
+        showRouteMapStatus("The map library did not load. Check your connection and reload this page.", true);
+        return false;
+    }
+    if (!routeMap) {
+        routeMap = L.map("route-map", { preferCanvas: true }).setView([39.5, -98.35], 4);
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>'
+        }).addTo(routeMap);
+        routeMap.on("dragstart", () => {
+            followCurrentLocation = false;
+        });
+        routeMap.on("tileerror", () => {
+            showRouteMapStatus("Map tiles could not be loaded. Check your connection or try again later.", true);
+        });
+    }
+    window.setTimeout(() => routeMap.invalidateSize(), 0);
+    if (currentRouteStart) updateMapLocation();
+    return true;
+}
+
+function updateMapLocation() {
+    if (!routeMap || !currentRouteStart) return;
+    const position = [currentRouteStart.latitude, currentRouteStart.longitude];
+    if (!currentLocationMarker) {
+        currentLocationMarker = L.circleMarker(position, {
+            radius: 8,
+            color: "#ffffff",
+            weight: 3,
+            fillColor: "#3578df",
+            fillOpacity: 1
+        }).addTo(routeMap);
+    } else {
+        currentLocationMarker.setLatLng(position);
+    }
+    if (currentRouteStart.accuracy > 0) {
+        if (!currentAccuracyCircle) {
+            currentAccuracyCircle = L.circle(position, {
+                radius: currentRouteStart.accuracy,
+                color: "#3578df",
+                weight: 1,
+                fillColor: "#3578df",
+                fillOpacity: 0.1
+            }).addTo(routeMap);
+        } else {
+            currentAccuracyCircle.setLatLng(position).setRadius(currentRouteStart.accuracy);
+        }
+    } else if (currentAccuracyCircle) {
+        routeMap.removeLayer(currentAccuracyCircle);
+        currentAccuracyCircle = null;
+    }
+    document.querySelector("#recenter-map").disabled = false;
+    if (followCurrentLocation) {
+        routeMap.setView(position, Math.max(routeMap.getZoom(), 15), { animate: false });
+    }
+}
+
+function clearRoutePreview() {
+    if (routeMap) {
+        [routePolyline, routeOriginMarker, routeDestinationMarker].forEach((layer) => {
+            if (layer) routeMap.removeLayer(layer);
+        });
+    }
+    routePolyline = null;
+    routeOriginMarker = null;
+    routeDestinationMarker = null;
+    const googleMapsLink = document.querySelector("#open-google-maps");
+    googleMapsLink.hidden = true;
+    googleMapsLink.removeAttribute("href");
+    showRouteMapStatus("Map tiles are provided by OpenStreetMap contributors.", false);
+}
+
+function invalidateRoutePreview() {
+    routeInputRevision += 1;
+    clearRoutePreview();
+}
+
+function setFollowCurrentLocation(follow) {
+    followCurrentLocation = follow;
+    if (follow && currentRouteStart && routeMap) {
+        routeMap.setView(
+            [currentRouteStart.latitude, currentRouteStart.longitude],
+            Math.max(routeMap.getZoom(), 15),
+            { animate: true }
+        );
+    }
+}
+
+async function geocodeAddress(address) {
+    const waitMs = Math.max(0, 1100 - (Date.now() - lastNominatimRequestAt));
+    if (waitMs > 0) await new Promise((resolve) => window.setTimeout(resolve, waitMs));
+    const url = new URL(NOMINATIM_URL);
+    url.searchParams.set("format", "jsonv2");
+    url.searchParams.set("limit", "1");
+    url.searchParams.set("q", address);
+    lastNominatimRequestAt = Date.now();
+
+    const response = await fetch(url, { headers: { Accept: "application/json" } });
+    if (!response.ok) {
+        throw new Error(`Address lookup failed (HTTP ${response.status}). Try a more complete address.`);
+    }
+    const matches = await response.json();
+    const match = Array.isArray(matches) ? matches[0] : null;
+    if (!match) {
+        throw new Error(`No map location was found for "${address}". Check the address and try again.`);
+    }
+    const latitude = Number(match.lat);
+    const longitude = Number(match.lon);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)
+        || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+        throw new Error(`The map service returned an invalid location for "${address}". Check the address and try again.`);
+    }
+    return {
+        latitude,
+        longitude,
+        label: typeof match.display_name === "string" ? match.display_name : address
+    };
+}
+
+function formatRouteDuration(seconds) {
+    const minutes = Math.round(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    return hours ? `${hours} hr ${minutes % 60} min` : `${minutes} min`;
+}
+
+async function previewRoute() {
+    const startAddress = document.querySelector("#route-start").value.trim();
+    const destinationAddress = document.querySelector("#route-destination").value.trim();
+    if (!startAddress || !destinationAddress) {
+        showRouteMapStatus("Enter a start point and exact destination address before previewing a route.", true);
+        return;
+    }
+    if (!ensureRouteMap()) return;
+
+    const button = document.querySelector("#preview-route");
+    const requestRevision = routeInputRevision;
+    button.disabled = true;
+    button.textContent = "Finding route…";
+    clearRoutePreview();
+    showRouteMapStatus("Looking up the route with public mapping services…", false);
+    try {
+        const origin = currentRouteStart || await geocodeAddress(startAddress);
+        const destination = await geocodeAddress(destinationAddress);
+        const routeUrl = `${OSRM_URL}/${origin.longitude},${origin.latitude};${destination.longitude},${destination.latitude}?overview=full&geometries=geojson`;
+        const response = await fetch(routeUrl, { headers: { Accept: "application/json" } });
+        if (!response.ok) {
+            throw new Error(`Route service failed (HTTP ${response.status}). Try again later.`);
+        }
+        const result = await response.json();
+        const route = result.code === "Ok" && Array.isArray(result.routes) ? result.routes[0] : null;
+        if (!route || !route.geometry || !Array.isArray(route.geometry.coordinates) || route.geometry.coordinates.length === 0) {
+            throw new Error("No road route was found between those points. Check the addresses and try again.");
+        }
+        if (!Number.isFinite(route.distance) || !Number.isFinite(route.duration)) {
+            throw new Error("The route service returned incomplete route details. Try again later.");
+        }
+        if (requestRevision !== routeInputRevision) {
+            showRouteMapStatus("Route points changed during lookup. Preview them again.", true);
+            return;
+        }
+
+        const routePoints = route.geometry.coordinates.map(([longitude, latitude]) => [latitude, longitude]);
+        routePolyline = L.polyline(routePoints, {
+            color: "#4e722e",
+            weight: 6,
+            opacity: 0.86,
+            lineCap: "round",
+            lineJoin: "round"
+        }).addTo(routeMap);
+        if (!currentRouteStart) {
+            routeOriginMarker = L.circleMarker([origin.latitude, origin.longitude], {
+                radius: 7,
+                color: "#ffffff",
+                weight: 2,
+                fillColor: "#799747",
+                fillOpacity: 1
+            }).addTo(routeMap);
+        }
+        const destinationPopup = document.createElement("span");
+        destinationPopup.textContent = `Drop-off: ${destinationAddress}`;
+        routeDestinationMarker = L.marker([destination.latitude, destination.longitude])
+            .bindPopup(destinationPopup)
+            .addTo(routeMap);
+        routeMap.fitBounds(routePolyline.getBounds(), { padding: [28, 28] });
+
+        const googleMapsUrl = new URL("https://www.google.com/maps/dir/");
+        googleMapsUrl.searchParams.set("api", "1");
+        if (!currentRouteStart) googleMapsUrl.searchParams.set("origin", startAddress);
+        googleMapsUrl.searchParams.set("destination", destinationAddress);
+        googleMapsUrl.searchParams.set("travelmode", "driving");
+        const googleMapsLink = document.querySelector("#open-google-maps");
+        googleMapsLink.href = googleMapsUrl.toString();
+        googleMapsLink.hidden = false;
+        showRouteMapStatus(
+            `Static route preview: ${formatNumber(route.distance / 1609.344)} mi · about ${formatRouteDuration(route.duration)}. It will not reroute and is not truck-certified.`,
+            false
+        );
+    } catch (error) {
+        console.error("Could not preview route:", error);
+        showRouteMapStatus(error instanceof Error ? error.message : "Could not preview this route. Check your connection and try again.", true);
+    } finally {
+        button.disabled = false;
+        button.textContent = "Preview route";
+    }
 }
 
 function stopLiveLocation(message) {
@@ -648,6 +669,8 @@ document.querySelector("#use-current-location").addEventListener("click", () => 
     const locationStatus = document.querySelector("#location-status");
     const routeStart = document.querySelector("#route-start");
     currentRouteStart = null;
+    invalidateRoutePreview();
+    followCurrentLocation = true;
     updateCurrentMapLink();
     if (routeStart.value.startsWith("Current location (")) routeStart.value = "";
     if (!navigator.geolocation) {
@@ -674,6 +697,7 @@ document.querySelector("#use-current-location").addEventListener("click", () => 
             locationStatus.textContent = `Live GPS · accuracy approx. ±${Math.round(currentRouteStart.accuracy)} m · not saved or sent to Haulwise.`;
             locationStatus.classList.remove("is-error");
             updateCurrentMapLink();
+            updateMapLocation();
         }, displayLocationError, { enableHighAccuracy: true, timeout: 20000, maximumAge: 3000 });
     } catch {
         liveLocationWatch = null;
@@ -691,6 +715,8 @@ document.querySelector("#stop-current-location").addEventListener("click", () =>
 document.querySelector("#route-start").addEventListener("input", () => {
     stopLiveLocation("");
     currentRouteStart = null;
+    invalidateRoutePreview();
+    document.querySelector("#recenter-map").disabled = true;
     updateCurrentMapLink();
     const locationStatus = document.querySelector("#location-status");
     locationStatus.textContent = "";
@@ -704,10 +730,8 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("pagehide", () => stopLiveLocation(""));
 
-document.querySelector("#import-local-data").addEventListener("click", importLocalData);
-document.querySelector("#account-signout").addEventListener("click", signOutAccount);
-
 document.querySelector("#route-facility-select").addEventListener("change", (event) => {
+    invalidateRoutePreview();
     const facility = getFacilityById(event.currentTarget.value);
     if (facility) {
         applyFacility(facility, document.querySelector("#route-destination"), document.querySelector("#route-entry-notes"));
@@ -718,6 +742,7 @@ document.querySelector("#route-facility-select").addEventListener("change", (eve
 });
 
 document.querySelector("#route-destination").addEventListener("input", () => {
+    invalidateRoutePreview();
     const facilitySelect = document.querySelector("#route-facility-select");
     if (facilitySelect.value) {
         facilitySelect.value = "";
@@ -741,6 +766,8 @@ document.querySelector("#trip-facility-select").addEventListener("change", (even
 document.querySelector("#facility-search").addEventListener("input", renderFacilities);
 document.querySelector("#share-route").addEventListener("click", shareRoute);
 document.querySelector("#copy-route").addEventListener("click", copyRoute);
+document.querySelector("#preview-route").addEventListener("click", previewRoute);
+document.querySelector("#recenter-map").addEventListener("click", () => setFollowCurrentLocation(true));
 document.querySelector("#show-facility-form").addEventListener("click", () => {
     const form = document.querySelector("#facility-form");
     form.reset();
@@ -795,8 +822,7 @@ document.querySelector("#trip-form").addEventListener("submit", (event) => {
         return;
     }
 
-    data.trips.push({
-        id: crypto.randomUUID(),
+    const trip = {
         company: String(values.get("company")).trim(),
         reference: String(values.get("reference")).trim(),
         origin: String(values.get("origin")).trim(),
@@ -807,12 +833,18 @@ document.querySelector("#trip-form").addEventListener("submit", (event) => {
         start,
         end,
         date: new Date().toISOString()
-    });
-    saveData();
+    };
+    try {
+        downloadTripCsv(trip);
+    } catch (error) {
+        console.error("Could not create trip download:", error);
+        showStatus("Could not create the trip file. Nothing was saved; try again or check browser download settings.", true);
+        return;
+    }
     renderTrips();
     form.reset();
     form.hidden = true;
-    showStatus("Trip saved to this browser's local demo log.", false);
+    showStatus("Trip downloaded as a CSV. It was not saved to the app or server.", false);
 });
 
 document.querySelector("#truck-form").addEventListener("submit", (event) => {
@@ -828,88 +860,8 @@ document.querySelector("#truck-form").addEventListener("submit", (event) => {
     showStatus("Truck details saved to this browser's local demo.", false);
 });
 
-document.querySelector("#team-invite-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const values = new FormData(event.currentTarget);
-    try {
-        const result = await fleetJson("/api/fleet/invitations", {
-            method: "POST",
-            body: JSON.stringify({ email: values.get("email"), role: values.get("role") })
-        });
-        event.currentTarget.reset();
-        document.querySelector("#team-invite-output").textContent = `Invite created for ${result.email}. Share the invitation code privately; it is shown once. Code: ${result.invitationCode}`;
-    } catch (error) {
-        showStatus(error.message, true);
-    }
-});
-
-document.querySelector("#payroll-period-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const values = new FormData(event.currentTarget);
-    try {
-        await fleetJson("/api/fleet/payroll/periods", {
-            method: "POST",
-            body: JSON.stringify({ name: values.get("name"), startDate: values.get("startDate"), endDate: values.get("endDate") })
-        });
-        event.currentTarget.reset();
-        await loadPayrollPeriods();
-    } catch (error) {
-        showStatus(error.message, true);
-    }
-});
-
-document.querySelector("#payroll-entry-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const values = new FormData(event.currentTarget);
-    const periodId = values.get("periodId");
-    if (!periodId) {
-        showStatus("Select a payroll period first.", true);
-        return;
-    }
-    try {
-        await fleetJson(`/api/fleet/payroll/periods/${encodeURIComponent(periodId)}/entries`, {
-            method: "POST",
-            body: JSON.stringify({
-                userId: values.get("userId"),
-                miles: values.get("miles"),
-                rate: values.get("rate")
-            })
-        });
-        event.currentTarget.reset();
-        await loadPayrollPeriods();
-        showStatus("Payroll entry added.", false);
-    } catch (error) {
-        showStatus(error.message, true);
-    }
-});
-
-document.querySelector("#eld-import").addEventListener("click", async () => {
-    const fileInput = document.querySelector("#eld-json");
-    const status = document.querySelector("#eld-status");
-    if (!fileInput.files?.length) {
-        status.textContent = "Choose a provider-neutral JSON export first.";
-        status.classList.add("is-error");
-        return;
-    }
-    try {
-        const trips = JSON.parse(await fileInput.files[0].text());
-        if (!Array.isArray(trips)) throw new Error("The JSON root must be an array of trips.");
-        const result = await fleetJson("/api/fleet/eld/import", {
-            method: "POST",
-            body: JSON.stringify({ trips })
-        });
-        status.textContent = `Imported ${result.imported} provider-neutral trips.`;
-        status.classList.remove("is-error");
-        fileInput.value = "";
-    } catch (error) {
-        status.textContent = error.message;
-        status.classList.add("is-error");
-    }
-});
-
 const today = new Date();
 document.querySelector("#today-label").textContent = today.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" }).toUpperCase();
 const greeting = today.getHours() < 12 ? "Good morning" : today.getHours() < 18 ? "Good afternoon" : "Good evening";
 document.querySelector("#page-title").innerHTML = `${greeting}, Jordan <span aria-hidden="true">👋</span>`;
 renderTrips();
-initializeAccountSync();

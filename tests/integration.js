@@ -1,48 +1,150 @@
 "use strict";
 
+const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
-
-const port = 3101;
-const server = spawn(process.execPath, ["server.js"], {
-    cwd: require("node:path").resolve(__dirname, ".."),
-    env: { ...process.env, PORT: String(port), APP_BASE_URL: `http://localhost:${port}` },
-    stdio: ["ignore", "pipe", "pipe"]
-});
+const fs = require("node:fs");
+const net = require("node:net");
+const path = require("node:path");
+const { createTripCsv } = require("../trip-export");
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function request(path) {
-    const response = await fetch(`http://localhost:${port}${path}`);
-    return { status: response.status, body: await response.text() };
+async function getFreePort() {
+    const listener = net.createServer();
+    await new Promise((resolve, reject) => {
+        listener.once("error", reject);
+        listener.listen(0, "127.0.0.1", resolve);
+    });
+    const { port } = listener.address();
+    await new Promise((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+    return port;
 }
 
 (async () => {
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-        try {
-            await request("/api/admin/setup-status");
-            break;
-        } catch {
-            await wait(100);
-        }
-        if (attempt === 29) throw new Error("Test server did not start.");
+    const port = await getFreePort();
+    const origin = `http://localhost:${port}`;
+    const server = spawn(process.execPath, [path.resolve(__dirname, "..", "server.js")], {
+        cwd: path.resolve(__dirname, ".."),
+        env: { ...process.env, PORT: String(port) },
+        stdio: ["ignore", "ignore", "pipe"]
+    });
+    let serverErrors = "";
+    server.stderr.setEncoding("utf8");
+    server.stderr.on("data", (chunk) => { serverErrors += chunk; });
+
+    async function request(urlPath) {
+        const response = await fetch(`${origin}${urlPath}`);
+        return { status: response.status, body: await response.text() };
     }
 
-    const setup = await request("/api/admin/setup-status");
-    if (setup.status !== 200) throw new Error("Setup status endpoint failed.");
+    async function waitForServer() {
+        for (let attempt = 0; attempt < 50; attempt += 1) {
+            if (server.exitCode !== null) throw new Error(`Test server exited unexpectedly. ${serverErrors}`);
+            try {
+                const response = await request("/haulwise/");
+                if (response.status === 200) return;
+            } catch {
+                await wait(100);
+            }
+        }
+        throw new Error(`Test server did not start. ${serverErrors}`);
+    }
 
-    const parsedSetup = JSON.parse(setup.body);
-    if (parsedSetup.configured !== false) throw new Error("Existing owner account unexpectedly remains.");
+    try {
+        await waitForServer();
 
-    const publicPage = await request("/haulwise/index.html");
-    if (publicPage.status !== 200) throw new Error("Haulwise public page failed.");
+        const navigationPages = [
+            "/",
+            "/work.html",
+            "/haulwise/",
+            "/haulwise/index.html",
+            "/haulwise/demo.html"
+        ];
+        const navigationDocuments = new Map();
+        for (const page of navigationPages) {
+            const result = await request(page);
+            assert.equal(result.status, 200, `Navigation page is unavailable: ${page}`);
+            navigationDocuments.set(page, result.body);
+        }
 
-    const privatePage = await request("/haulwise/api.js");
-    if (privatePage.status !== 404) throw new Error("Private server source was publicly accessible.");
+        for (const [page, html] of navigationDocuments) {
+            const links = html.matchAll(/<a\b[^>]*\bhref=(["'])(.*?)\1/gi);
+            for (const [, , href] of links) {
+                const target = new URL(href, `${origin}${page}`);
+                if (!["http:", "https:"].includes(target.protocol) || target.origin !== origin) continue;
 
-    console.log("Integration smoke checks passed.");
-    server.kill("SIGTERM");
+                const targetPage = await request(`${target.pathname}${target.search}`);
+                assert.equal(targetPage.status, 200, `Broken navigation link: ${page} -> ${href}`);
+                if (target.hash) {
+                    const targetHtml = navigationDocuments.get(target.pathname) || targetPage.body;
+                    const fragment = decodeURIComponent(target.hash.slice(1));
+                    assert.ok(
+                        targetHtml.includes(`id="${fragment}"`) || targetHtml.includes(`id='${fragment}'`),
+                        `Missing navigation target: ${page} -> ${href}`
+                    );
+                }
+            }
+        }
+
+        for (const removedPage of [
+            "/haulwise/account.html",
+            "/haulwise/admin.html",
+            "/haulwise/admin-setup.html",
+            "/haulwise/checkout.html",
+            "/haulwise/subscriptions.html",
+            "/api/auth/login",
+            "/api/auth/register",
+            "/api/account/data"
+        ]) {
+            assert.equal((await request(removedPage)).status, 404, `Removed feature still responds: ${removedPage}`);
+        }
+
+        const demo = navigationDocuments.get("/haulwise/demo.html");
+        assert.doesNotMatch(demo, /account\.html|sign.?up|log.?in|payroll|team &amp; roles|DOT \/ ELD/i);
+        assert.match(demo, /id="route-map"/);
+        assert.match(demo, /id="preview-route"/);
+        assert.match(demo, /not Haulwise/);
+        assert.equal((await request("/haulwise/vendor/leaflet/leaflet.js")).status, 200);
+        assert.equal((await request("/haulwise/vendor/leaflet/leaflet.css")).status, 200);
+        const appJs = fs.readFileSync(path.resolve(__dirname, "..", "app.js"), "utf8");
+        assert.match(appJs, /function downloadTripCsv\(trip\)/);
+        assert.match(appJs, /createTripCsv\(trip, data\.truck\)/);
+        assert.match(appJs, /data\.trips = \[\]/);
+        assert.match(appJs, /nominatim\.openstreetmap\.org/);
+        assert.match(appJs, /router\.project-osrm\.org/);
+        assert.doesNotMatch(appJs, /fetch\(["'`]\/api\/|data\.trips\.push/);
+
+        const tripFile = createTripCsv({
+            date: "2026-01-15T12:00:00.000Z",
+            company: "Demo, Freight",
+            reference: "=1+1",
+            origin: "Columbus, OH",
+            originAddress: "1 Start St",
+            destination: "Cleveland, OH",
+            address: "2 End St",
+            entry: "Use gate \"A\"",
+            start: 100,
+            end: 250
+        }, { name: "Test Truck", unit: "9", plate: "" });
+        assert.equal(tripFile.filename, "haulwise-trip-2026-01-15-1-1.csv");
+        assert.ok(tripFile.contents.startsWith("\uFEFF\"Date\",\"Company / load\""));
+        assert.match(tripFile.contents, /"Demo, Freight"/);
+        assert.match(tripFile.contents, /"Use gate ""A"""/);
+        assert.match(tripFile.contents, /"150"/);
+        assert.match(tripFile.contents, /"'=1\+1"/);
+
+        const databaseFile = path.resolve(__dirname, "..", ".haulwise-data", "haulwise.sqlite");
+        assert.equal(fs.existsSync(databaseFile), false, "The public server must not create a trip database.");
+
+        console.log("Free public pages, CSV exports, privacy, and no-database checks passed.");
+    } finally {
+        if (server.exitCode === null) {
+            const stopped = new Promise((resolve) => server.once("exit", resolve));
+            server.kill("SIGTERM");
+            await stopped;
+        }
+    }
 })().catch((error) => {
-    console.error(error.message);
-    server.kill("SIGTERM");
+    console.error(error);
     process.exitCode = 1;
 });
